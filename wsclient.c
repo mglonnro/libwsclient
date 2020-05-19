@@ -62,7 +62,23 @@ void *libwsclient_run_thread(void *ptr) {
 	if(c->onclose) {
 		c->onclose(c);
 	}
+
+   	if(c->flags & CLIENT_IS_SSL) {
+        	SSL_shutdown(c->ssl);
+        	SSL_free(c->ssl);
+        	SSL_CTX_free(c->ssl_ctx);
+    	}
+
 	close(c->sockfd);
+
+ 	if (c->URI) {
+		free(c->URI);
+		c->URI = NULL;
+	}
+	libwsclient_cleanup_frames(c->current_frame);
+	
+	pthread_mutex_destroy(&c->lock);
+    	pthread_mutex_destroy(&c->send_lock);
 	free(c);
 	return NULL;
 }
@@ -525,12 +541,14 @@ void *libwsclient_handshake_thread(void *ptr) {
 	p = strstr(URI_copy, "://");
 	if(p == NULL) {
 		fprintf(stderr, "Malformed or missing scheme for URI.\n");
+		free(URI_copy);
 		exit(WS_EXIT_BAD_SCHEME);
 	}
 	strncpy(scheme, URI_copy, p-URI_copy);
 	scheme[p-URI_copy] = '\0';
 	if(strcmp(scheme, "ws") != 0 && strcmp(scheme, "wss") != 0) {
 		fprintf(stderr, "Invalid scheme for URI: %s\n", scheme);
+		free(URI_copy);
 		exit(WS_EXIT_BAD_SCHEME);
 	}
 	if(strcmp(scheme, "ws") == 0) {
@@ -666,6 +684,7 @@ void *libwsclient_handshake_thread(void *ptr) {
 					free(err);
 					err = NULL;
 				}
+				free(rcv);
 				return NULL;
 			}
 			flags |= REQUEST_VALID_STATUS;
@@ -689,6 +708,8 @@ void *libwsclient_handshake_thread(void *ptr) {
 			}
 		}
 	}
+
+	free(rcv);
 	if(!flags & REQUEST_HAS_UPGRADE) {
 		if(client->onerror) {
 			err = libwsclient_new_error(WS_HANDSHAKE_NO_UPGRADE_ERR);
