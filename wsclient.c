@@ -23,15 +23,18 @@
 void libwsclient_run(wsclient *c) {
 	if(c->flags & CLIENT_CONNECTING) {
 		pthread_join(c->handshake_thread, NULL);
-		pthread_mutex_lock(&c->lock);
-		c->flags &= ~CLIENT_CONNECTING;
-		free(c->URI);
-		c->URI = NULL;
-		pthread_mutex_unlock(&c->lock);
 	}
 	if(c->sockfd) {
 		pthread_create(&c->run_thread, NULL, libwsclient_run_thread, (void *)c);
 	}
+	if (c->run_thread) {
+		// If the handshake wasn't succesful, the CLIENT_CONNECTING flag is still on, 
+		// so the run_thred will run right through and can be joined here.
+		// TODO, join (without blocking) also a properly exited run thread.
+		if (c->flags & CLIENT_CONNECTING) {
+			pthread_join(c->run_thread, NULL);
+		}
+	}	
 }
 
 void *libwsclient_run_thread(void *ptr) {
@@ -40,6 +43,8 @@ void *libwsclient_run_thread(void *ptr) {
 	int sockfd;
 	char buf[1024];
 	int n, i;
+
+	if (! (c->flags & CLIENT_CONNECTING) ) {
 	do {
 		memset(buf, 0, 1024);
 		n = _libwsclient_read(c, buf, 1023);
@@ -57,6 +62,7 @@ void *libwsclient_run_thread(void *ptr) {
 			err = NULL;
 		}
 
+	}
 	}
 
 	if(c->onclose) {
@@ -79,6 +85,7 @@ void *libwsclient_run_thread(void *ptr) {
 	
 	pthread_mutex_destroy(&c->lock);
     	pthread_mutex_destroy(&c->send_lock);
+
 	free(c);
 	return NULL;
 }
@@ -382,6 +389,7 @@ int libwsclient_open_connection(const char *host, const char *port) {
 	if(p == NULL) {
 		return WS_OPEN_CONNECTION_ADDRINFO_EXHAUSTED_ERR;
 	}
+
 	return sockfd;
 }
 
@@ -505,9 +513,13 @@ wsclient *libwsclient_new(const char *URI) {
 	client->flags |= CLIENT_CONNECTING;
 	pthread_mutex_unlock(&client->lock);
 
-	if(pthread_create(&client->handshake_thread, NULL, libwsclient_handshake_thread, (void *)client)) {
-		fprintf(stderr, "Unable to create handshake thread.\n");
+	int err = 0;
+
+	if(err = pthread_create(&client->handshake_thread, NULL, libwsclient_handshake_thread, (void *)client)) {
+		fprintf(stderr, "Unable to create handshake thread. errno = %d\n", err);
 		exit(WS_EXIT_PTHREAD_CREATE);
+	} else {
+		fprintf(stderr, "Created handshake thread %lx\n", client->handshake_thread);
 	}
 	return client;
 }
@@ -531,6 +543,10 @@ void *libwsclient_handshake_thread(void *ptr) {
 	char recv_buf[1024];
 	char *URI_copy = NULL, *p = NULL, *rcv = NULL, *tok = NULL;
 	int i, z, sockfd, n, flags = 0, headers_space = 1024;
+
+	memset(host, 0, 255);
+	memset(request_host, 0, 255);
+
 	URI_copy = (char *)malloc(strlen(URI)+1);
 	if(!URI_copy) {
 		fprintf(stderr, "Unable to allocate memory in libwsclient_new.\n");
@@ -581,7 +597,6 @@ void *libwsclient_handshake_thread(void *ptr) {
 	free(URI_copy);
 	sockfd = libwsclient_open_connection(host, port);
 
-
 	if(sockfd < 0) {
 		if(client->onerror) {
 			err = libwsclient_new_error(sockfd);
@@ -596,13 +611,26 @@ void *libwsclient_handshake_thread(void *ptr) {
 	if(client->flags & CLIENT_IS_SSL) {
 		if((libwsclient_flags & WS_FLAGS_SSL_INIT) == 0) {
 			SSL_library_init();
+			OpenSSL_add_all_algorithms();
 			SSL_load_error_strings();
 			libwsclient_flags |= WS_FLAGS_SSL_INIT;
 		}
+		pthread_mutex_lock(&client->lock);
 		client->ssl_ctx = SSL_CTX_new(SSLv23_method());
+		pthread_mutex_unlock(&client->lock);
+		if(client->ssl_ctx == NULL) {
+            		ERR_print_errors_fp(stderr);
+            		return NULL;
+        	}
+		pthread_mutex_lock(&client->lock);
 		client->ssl = SSL_new(client->ssl_ctx);
 		SSL_set_fd(client->ssl, sockfd);
-		SSL_connect(client->ssl);
+		pthread_mutex_unlock(&client->lock);
+		if (SSL_connect(client->ssl) == -1) {
+			ERR_print_errors_fp(stderr);
+		} else {
+			printf("Connected with %s encryption.\n", SSL_get_cipher(client->ssl));
+		}
 	}
 #endif
 
@@ -745,6 +773,7 @@ void *libwsclient_handshake_thread(void *ptr) {
 	if(client->onopen != NULL) {
 		client->onopen(client);
 	}
+
 	return NULL;
 }
 
